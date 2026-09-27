@@ -6,8 +6,20 @@ or change any tracker adapter's decisions.
 
 ## Flow
 
-`SessionManager` attaches `HistoryRecorder` alongside `ScrobbleController` before waiting
-for tracker resolution. Play, pause, ended, pagehide and teardown produce local events.
+`SessionManager.ensureHistory()` attaches `HistoryRecorder` as soon as local media and a
+video are available. It does not create, start or stop a `ScrobbleController`. The normal
+`reconcile()` flow finishes resolution and badge preflight before `ensurePlaying()`
+attaches the tracker controller. Pending, failed or disconnected tracker resolution
+does not stop local observation. Repeated reconcile/play/discovery calls cannot bypass
+a pending preflight, and stale replies cannot unlock a newer publication. Player iframes
+retain upstream's existing published-media path, which has no per-frame resolver preflight.
+
+`PlaybackEvents` owns one listener set per video with separate, abortable subscriptions
+for history and scrobbling. Attaching the tracker later retains the local viewing period.
+Replacing media or a player closes the old local period immediately, while the outgoing
+tracker stays on its original lifecycle until normal tracker attachment/teardown.
+Full teardown closes both and removes their listeners and pending discovery timers.
+Play, pause, ended, pagehide and teardown produce local events.
 Timeupdate observations reuse the five-second persistence cadence. Crossing the recipe's
 watched threshold emits a stop, while later playback continues to produce checkpoints.
 The existing controller and tracker messages retain their original behavior.
@@ -15,7 +27,8 @@ The existing controller and tracker messages retain their original behavior.
 `recordHistory` messages write IndexedDB on the extension origin in the background. Each
 operation opens the database, commits its transaction, and closes the connection. No
 ledger state depends on service-worker memory or browser storage. Tab removal appends a
-best-effort stop from the last checkpoint and removes its ownership records.
+best-effort stop from the last checkpoint and removes its ownership records. It runs in
+an independent tab-removal listener so IndexedDB latency cannot hold up tracker recovery.
 
 ## Database version 1
 

@@ -23,6 +23,7 @@ import {
 } from "@tmsync/shared";
 import type { ContentScriptContext } from "wxt/utils/content-script-context";
 import { ScrobbleController } from "./controller";
+import { PlaybackEvents } from "./playback";
 
 const RECONCILE_DEBOUNCE_MS = 600;
 /** Hard cap on how long a mutation burst may postpone a pending reconcile. */
@@ -354,6 +355,9 @@ export class SessionManager {
    * anime-map crosswalk in the background. Kept in sync with `tracker`. */
   private trackers: Tracker[] = ["trakt"];
   private lastPublishedKey: string | null = null;
+  /** A publication is tracker-ready only after its original badge/preflight flow finishes. */
+  private readyPublishedKey: string | null = null;
+  private publicationVersion = 0;
   /** Top frame: a matched recipe is currently showing a badge for this tab. Lets
    * us (a) clear the badge + stop the session when an SPA navigates AWAY to a
    * non-scrobblable page, and (b) drop a scrobble's late UI reply once we've left
@@ -380,11 +384,17 @@ export class SessionManager {
   private currentVideo: HTMLVideoElement | null = null;
   private controller: ScrobbleController | null = null;
   private history: HistoryRecorder | null = null;
+  private historyVideo: HTMLVideoElement | null = null;
+  private historyKey: string | null = null;
+  private historyAbort: AbortController | null = null;
+  private readonly playback = new PlaybackEvents(() => this.scheduleReconcile());
   private abort: AbortController | null = null;
   private reconcileTimer: ReturnType<typeof setTimeout> | null = null;
   /** Latest time the currently pending reconcile may be postponed to. */
   private reconcileDeadline = 0;
   private videoObserver: MutationObserver | null = null;
+  private videoObserverTimer: ReturnType<typeof setTimeout> | null = null;
+  private waitingForScrobbleVideo = false;
   /** Bounded count of synthetic player-nudges this session (reveal hover-gated bars). */
   private metadataNudges = 0;
   /** Until when the page counts as "settling" after a client-side navigation. The
@@ -471,10 +481,17 @@ export class SessionManager {
 
     // Any video starting to play is a strong signal to (re-)evaluate — catches a
     // player that reuses the trailer's element or appears only after Play.
-    window.addEventListener("play", () => void this.ensurePlaying(), {
-      capture: true,
-      signal: this.frameSignal(),
-    });
+    window.addEventListener(
+      "play",
+      () => {
+        this.ensureHistory();
+        void this.ensurePlaying();
+      },
+      {
+        capture: true,
+        signal: this.frameSignal(),
+      },
+    );
 
     void this.reconcile();
     // Run in EVERY frame, not just the top: aggregator embeds nest iframes (rive →
@@ -644,6 +661,8 @@ export class SessionManager {
       return;
     }
 
+    this.ensureHistory(media);
+
     // Avoid churn from the head observer firing on unrelated mutations. The key
     // includes the tracker set so re-toggling trackers on the SAME media (a recipe
     // edit) still re-publishes — otherwise the "now playing" panel keeps the stale
@@ -651,6 +670,8 @@ export class SessionManager {
     const key = `${mediaKey(media)}|${this.tracker}|${this.trackers.join(",")}`;
     if (key === this.lastPublishedKey) return;
     this.lastPublishedKey = key;
+    this.readyPublishedKey = null;
+    const publication = ++this.publicationVersion;
 
     await sendMessage("publishMedia", {
       media,
@@ -664,12 +685,11 @@ export class SessionManager {
     // Seed the badge immediately with the scraped title, then refine it with what
     // the tracker actually matched — so the user can verify (and fix) the target
     // BEFORE pressing play, not only after the first scrobble fires.
-    // Attach before any network resolution so offline playback is still observed.
-    await this.ensurePlaying();
     const trackerName = trackerLabel(this.tracker);
     const seasonless = isSeasonless(this.tracker); // per-cour trackers have no seasons
     await sendMessage("reportScrobble", { state: "idle", title: label(media, seasonless) });
     const resolved = await sendMessage("resolveMedia", { media, tracker: this.tracker });
+    if (publication !== this.publicationVersion) return;
     if (!(resolved.resolved && resolved.title)) {
       await sendMessage("reportScrobble", {
         state: "error",
@@ -688,6 +708,7 @@ export class SessionManager {
         media.episode !== undefined && this.trackers.some(isSeasonless)
           ? await sendMessage("getWatchStanding", {})
           : [];
+      if (publication !== this.publicationVersion) return;
       const rewatchTrackers = standing.filter((w) => w.completed).map((w) => w.tracker);
       const allAlready =
         standing.length === this.trackers.length && standing.every((w) => w.already);
@@ -732,6 +753,7 @@ export class SessionManager {
     // un-enabled player frame now (not only on the next DOM mutation), so a static
     // watch page still gets the "enable the player frame" hint.
     if (this.isTop && !this.findVideo()) void this.scanPlayerFrames();
+    if (publication === this.publicationVersion) this.readyPublishedKey = key;
   }
 
   /**
@@ -773,9 +795,12 @@ export class SessionManager {
     this.localMedia = media;
     // A manually-picked movie still routes to Trakt (constraint #1).
     this.tracker = routeTracker(recipe.tracker, media.mediaType);
+    this.ensureHistory(media);
     const key = `manual:${pageKey}:${mediaKey(media)}`;
     if (key === this.lastPublishedKey) return;
     this.lastPublishedKey = key;
+    this.readyPublishedKey = null;
+    const publication = ++this.publicationVersion;
 
     await sendMessage("publishMedia", {
       media,
@@ -787,8 +812,8 @@ export class SessionManager {
     });
     // The pick is locked to a Trakt entry via a correction, so resolveMedia hits;
     // either way the title is set, so seed the badge and let play scrobble it.
-    await this.ensurePlaying();
     const resolved = await sendMessage("resolveMedia", { media, tracker: this.tracker });
+    if (publication !== this.publicationVersion) return;
     const seasonless = isSeasonless(this.tracker);
     await sendMessage("reportScrobble", {
       state: "idle",
@@ -798,6 +823,7 @@ export class SessionManager {
           : label(media, seasonless),
       detail: "press play to scrobble",
     });
+    if (publication === this.publicationVersion) this.readyPublishedKey = key;
   }
 
   /**
@@ -846,6 +872,13 @@ export class SessionManager {
    * dedup in the background — a wrong "iframe"/"top" guess no longer blocks it.
    */
   private async ensurePlaying(): Promise<void> {
+    // Reconcile, play and video-discovery can race a pending preflight. None of
+    // them may turn an early local observer into an early tracker controller.
+    if (
+      this.localMedia &&
+      (!this.lastPublishedKey || this.lastPublishedKey !== this.readyPublishedKey)
+    )
+      return;
     let media = this.localMedia;
     if (!media) {
       const tab = await this.pullTabMedia();
@@ -860,7 +893,7 @@ export class SessionManager {
     }
 
     const key = mediaKey(media);
-    if (this.abort && key === this.currentKey && this.currentVideo === video) return; // already running
+    if (this.controller && key === this.currentKey && this.currentVideo === video) return;
 
     this.startSession(video, media);
   }
@@ -947,29 +980,33 @@ export class SessionManager {
     return [...set];
   }
 
-  private observeForVideo(): void {
+  private observeForVideo(scrobble = true): void {
+    if (scrobble) this.waitingForScrobbleVideo = true;
     if (this.videoObserver) return;
     // Debounce: findVideo() scans the whole document, and on a busy SPA (React
     // re-renders, ad/carousel churn) the subtree observer fires constantly — an
     // unthrottled scan here saturated the main thread ("page not responding"),
     // and on a landing page whose only <video> is a muted background trailer
     // (excluded by findVideo) it never stops. A short debounce keeps it cheap.
-    let timer: ReturnType<typeof setTimeout> | null = null;
     const check = () => {
-      timer = null;
+      this.videoObserverTimer = null;
       if (this.findVideo()) {
         this.videoObserver?.disconnect();
         this.videoObserver = null;
-        void this.ensurePlaying();
+        this.ensureHistory();
+        if (this.waitingForScrobbleVideo) {
+          this.waitingForScrobbleVideo = false;
+          void this.ensurePlaying();
+        }
       }
     };
     this.videoObserver = new MutationObserver(() => {
-      if (timer) return;
-      timer = setTimeout(check, 400);
+      if (this.videoObserverTimer) return;
+      this.videoObserverTimer = setTimeout(check, 400);
     });
     this.videoObserver.observe(document.documentElement, { childList: true, subtree: true });
     this.ctx.onInvalidated(() => {
-      if (timer) clearTimeout(timer);
+      if (this.videoObserverTimer) clearTimeout(this.videoObserverTimer);
       this.videoObserver?.disconnect();
     });
   }
@@ -990,22 +1027,25 @@ export class SessionManager {
     );
   }
 
-  private startSession(video: HTMLVideoElement, media: ParsedMedia): void {
-    this.teardownSession();
-
+  /** Local observation never resolves a tracker or attaches a ScrobbleController. */
+  private ensureHistory(media = this.localMedia, video = this.findVideo()): void {
+    if (!media) return;
+    const key = mediaKey(media);
+    if (this.history && this.historyKey === key && this.historyVideo === video) return;
+    this.teardownHistory();
+    if (!video) {
+      this.observeForVideo(false);
+      return;
+    }
     const abort = new AbortController();
-    this.abort = abort;
-    this.currentVideo = video;
-    this.currentKey = mediaKey(media);
-
-    const tracker = this.tracker;
-    const trackers = this.trackers;
-    const watchedThreshold = this.watchedThreshold;
+    this.historyAbort = abort;
+    this.historyVideo = video;
+    this.historyKey = key;
     const history = new HistoryRecorder(
       video,
       media,
       location.hostname,
-      watchedThreshold,
+      this.watchedThreshold,
       (checkpoint) => {
         void sendMessage("recordHistory", checkpoint).catch(() => {
           console.warn("[TMSync] Local history checkpoint could not be saved");
@@ -1013,12 +1053,54 @@ export class SessionManager {
       },
     );
     this.history = history;
+    this.playback.observe(
+      video,
+      (event) => {
+        switch (event) {
+          case "play":
+            history.start();
+            break;
+          case "pause":
+            if (!video.ended) history.pause();
+            break;
+          case "ended":
+            history.stop(true);
+            break;
+          case "seeking":
+          case "seeked":
+          case "ratechange":
+            history.discontinuity();
+            break;
+          case "timeupdate":
+            history.tick();
+            break;
+          case "pagehide":
+            history.stop();
+            break;
+        }
+      },
+      abort.signal,
+    );
+    if (!video.paused && !video.ended) history.start();
+  }
+
+  private startSession(video: HTMLVideoElement, media: ParsedMedia): void {
+    this.teardownScrobble();
+    this.ensureHistory(media, video);
+    const history = this.history;
+    const abort = new AbortController();
+    this.abort = abort;
+    this.currentVideo = video;
+    this.currentKey = mediaKey(media);
+    const tracker = this.tracker;
+    const trackers = this.trackers;
+    const watchedThreshold = this.watchedThreshold;
     const controller = new ScrobbleController(
       video,
       (action, progress) => {
         this.lastAction = action;
         void sendMessage("scrobble", {
-          historySessionId: history.sessionId,
+          historySessionId: history?.sessionId,
           action,
           media,
           progress,
@@ -1051,48 +1133,28 @@ export class SessionManager {
     );
     this.controller = controller;
 
-    const on = (target: EventTarget, type: string, fn: () => void) =>
-      target.addEventListener(type, fn, { signal: abort.signal });
-
-    on(video, "play", () => {
-      history.start();
-      controller.play();
-    });
-    on(video, "pause", () => {
-      if (!video.ended) history.pause();
-      controller.pause();
-    });
-    on(video, "ended", () => {
-      history.stop(true);
-      controller.ended();
-    });
-    on(video, "seeking", () => history.discontinuity());
-    on(video, "seeked", () => history.discontinuity());
-    on(video, "ratechange", () => history.discontinuity());
-    // New media loaded into the same element (SPA episode swap) → reconcile.
-    on(video, "loadstart", this.scheduleReconcile);
-    on(window, "pagehide", () => {
-      history.stop();
-      controller.leave();
-    });
-
     let lastPersist = 0;
-    on(video, "timeupdate", () => {
-      history.tick();
-      // Commit to history the moment playback crosses the threshold — no pause
-      // or `ended` required. Cheap + idempotent (one stop per session).
-      controller.progressTick();
-      const now = Date.now();
-      if (now - lastPersist < PROGRESS_PERSIST_MS) return;
-      lastPersist = now;
-      void sendMessage("updateProgress", controller.progress());
-    });
+    this.playback.observe(
+      video,
+      (event) => {
+        if (event === "play") controller.play();
+        if (event === "pause") controller.pause();
+        if (event === "ended") controller.ended();
+        if (event === "pagehide") controller.leave();
+        if (event !== "timeupdate") return;
+        // Commit to history the moment playback crosses the threshold — no pause
+        // or `ended` required. Cheap + idempotent (one stop per session).
+        controller.progressTick();
+        const now = Date.now();
+        if (now - lastPersist < PROGRESS_PERSIST_MS) return;
+        lastPersist = now;
+        void sendMessage("updateProgress", controller.progress());
+      },
+      abort.signal,
+    );
 
     // If playback is already underway when we attach (late injection), kick a start.
-    if (!video.paused && !video.ended) {
-      history.start();
-      controller.play();
-    }
+    if (!video.paused && !video.ended) controller.play();
   }
 
   /**
@@ -1133,8 +1195,30 @@ export class SessionManager {
   }
 
   private teardownSession(): void {
+    this.teardownHistory();
+    this.teardownScrobble();
+    this.readyPublishedKey = null;
+    this.lastPublishedKey = null;
+    this.publicationVersion++;
+    this.waitingForScrobbleVideo = false;
+    this.videoObserver?.disconnect();
+    this.videoObserver = null;
+    if (this.videoObserverTimer) clearTimeout(this.videoObserverTimer);
+    this.videoObserverTimer = null;
+    if (this.reconcileTimer) clearTimeout(this.reconcileTimer);
+    this.reconcileTimer = null;
+  }
+
+  private teardownHistory(): void {
     this.history?.stop();
     this.history = null;
+    this.historyAbort?.abort();
+    this.historyAbort = null;
+    this.historyVideo = null;
+    this.historyKey = null;
+  }
+
+  private teardownScrobble(): void {
     this.metadataNudges = 0;
     // Emit a stop for the outgoing session (SPA episode swap, nav away) before
     // dropping its listeners. ScrobbleController.leave() is idempotent.

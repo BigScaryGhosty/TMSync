@@ -880,10 +880,12 @@ export default defineBackground(() => {
   });
 
   // Reconcile a stop if a tab dies before a clean one (point: lost stops).
-  browser.tabs.onRemoved.addListener(async (tabId) => {
-    await closeHistoryTab(tabId).catch(() => {
+  browser.tabs.onRemoved.addListener((tabId) => {
+    void closeHistoryTab(tabId).catch(() => {
       console.warn("[TMSync] Local history tab close could not be saved");
     });
+  });
+  browser.tabs.onRemoved.addListener(async (tabId) => {
     // The tab is gone — drop its accumulated player-frame origins + status.
     await clearTabStatus(tabId);
     const frames = await tabFrameOrigins.getValue();
