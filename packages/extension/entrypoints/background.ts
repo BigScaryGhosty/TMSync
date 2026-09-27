@@ -31,6 +31,7 @@ import {
 import type { Animap } from "@/lib/animap/index";
 import { loadAnimap, parseAnimeMap } from "@/lib/animap/load";
 import { errorMessage } from "@/lib/errors";
+import { closeHistoryTab, enrichHistory, recordHistory } from "@/lib/history/store";
 import { hasMalAccess, isMalGrant } from "@/lib/mal/access";
 import {
   connect as malConnect,
@@ -50,7 +51,7 @@ import {
   isConnected as simklIsConnected,
   getRedirectUri as simklRedirectUri,
 } from "@/lib/simkl/auth";
-import { HELD_STOP_ALARM, flushHeldStops } from "@/lib/simkl/client";
+import { HELD_STOP_ALARM, flushHeldStops, getMatch } from "@/lib/simkl/client";
 import { SIMKL } from "@/lib/simkl/config";
 import {
   simklDeleteNote,
@@ -383,6 +384,18 @@ export default defineBackground(() => {
   // identity (cached) and record progress. The scrobble trackers (Trakt, Simkl) and
   // the list trackers (AniList, MAL, one threshold write) differ entirely. That
   // lives behind the adapter; this handler is tracker-agnostic.
+  onMessage("recordHistory", async ({ data, sender }) => {
+    const tabId = sender.tab?.id;
+    if (tabId === undefined) return false;
+    try {
+      const sourceHost = sender.tab?.url ? new URL(sender.tab.url).hostname : data.sourceHost;
+      return await recordHistory({ ...data, sourceHost }, { tabId, frameId: sender.frameId ?? 0 });
+    } catch {
+      console.warn("[TMSync] Local history checkpoint could not be saved");
+      return false;
+    }
+  });
+
   onMessage("scrobble", async ({ data, sender }) => {
     // Only one frame records per tab (page + player iframe would otherwise both
     // fire start/pause/stop for the same item → Trakt rejects out-of-order).
@@ -868,6 +881,9 @@ export default defineBackground(() => {
 
   // Reconcile a stop if a tab dies before a clean one (point: lost stops).
   browser.tabs.onRemoved.addListener(async (tabId) => {
+    await closeHistoryTab(tabId).catch(() => {
+      console.warn("[TMSync] Local history tab close could not be saved");
+    });
     // The tab is gone — drop its accumulated player-frame origins + status.
     await clearTabStatus(tabId);
     const frames = await tabFrameOrigins.getValue();
@@ -938,7 +954,9 @@ async function recordScrobble(
   } catch (e) {
     nativeError = errorMessage(e);
   }
+  if (nativeItem) rememberHistoryIdentity(data.historySessionId, nativeItem);
   const nativeReply = await recordNative(native, nativeItem, nativeError, data);
+  if (native === "simkl") rememberSimklHistory(data.historySessionId, data.media);
 
   // Derive + record every OTHER enabled tracker via the crosswalk (+ overrides).
   // The native item is the anchor: a reverse (cour → seasoned) derive bridges from
@@ -962,6 +980,24 @@ async function recordScrobble(
     derived.push(...late.map((tracker) => ({ tracker, ok: true, deferred: true })));
   }
   return { ...nativeReply, derived: derived.length ? derived : undefined };
+}
+
+function rememberHistoryIdentity(sessionId: string | undefined, item: TrackedItem): void {
+  if (!sessionId || !item.id) return;
+  void enrichHistory(sessionId, {
+    ...("ids" in item ? item.ids : {}),
+    [item.tracker]: item.id,
+  }).catch(() => console.warn("[TMSync] Local history identity could not be saved"));
+}
+
+function rememberSimklHistory(sessionId: string | undefined, media: ParsedMedia): void {
+  if (!sessionId) return;
+  // Simkl only supplies its id after writing. Read its existing local match cache.
+  void getMatch(media)
+    .then((match) => {
+      if (match) return enrichHistory(sessionId, { simkl: match.id });
+    })
+    .catch(() => console.warn("[TMSync] Local history identity could not be saved"));
 }
 
 /** Record the native tracker directly and shape the badge's primary reply. */
@@ -1265,6 +1301,7 @@ async function recordDerivedTrackers(
     item: TrackedItem,
     media: ParsedMedia,
   ): Promise<DerivedOutcome> => {
+    rememberHistoryIdentity(data.historySessionId, item);
     const r = await getAdapter(target).recordProgress(
       item,
       media,
@@ -1272,6 +1309,7 @@ async function recordDerivedTrackers(
       data.action,
       data.watchedThreshold ?? 0.8,
     );
+    if (target === "simkl") rememberSimklHistory(data.historySessionId, media);
     return {
       tracker: target,
       ok: r.ok,

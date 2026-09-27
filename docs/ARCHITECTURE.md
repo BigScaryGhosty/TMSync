@@ -209,7 +209,13 @@ connect, search, and register/unregister. All handlers live in `background.ts`.
 
 ## 8. Storage — `packages/extension/lib/storage.ts`
 
-Every persisted value is a `storage.defineItem`, split by prefix:
+Viewing history is canonical in the extension-origin IndexedDB ledger, independently of
+tracker connections. `lib/history/` records viewing periods and events alongside the
+existing scrobble lifecycle. See [LOCAL-HISTORY.md](./LOCAL-HISTORY.md) for schema,
+time accounting and recovery semantics. This ledger is separate from tracker caches
+and the ephemeral tab-session reconciliation state below.
+
+Other persisted values use `storage.defineItem`, split by prefix:
 
 - **`sync:`** — small, cross-device, user-owned: `custom_recipes`, `quick_links`, `corrections`,
   `manual_selections`, `badge_prefs`.

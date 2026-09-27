@@ -30,6 +30,7 @@
     "@preact/preset-vite": "^2.10.1",
     "@tailwindcss/vite": "^4.3.0",
     "clsx": "^2.1.1",
+    "fake-indexeddb": "^6.2.5",
     "happy-dom": "^15.11.7",
     "tailwindcss": "^4.3.0",
     "typescript": "^5.7.3",

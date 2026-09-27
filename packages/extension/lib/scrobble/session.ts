@@ -1,3 +1,4 @@
+import { HistoryRecorder } from "@/lib/history/recorder";
 import { quickLinkSlugs } from "@/lib/storage";
 import { routeTracker } from "@/lib/tracker";
 import { type Tracker, isSeasonless, trackerLabel } from "@/lib/tracker/types";
@@ -378,6 +379,7 @@ export class SessionManager {
   private lastAction: "start" | "pause" | "stop" | null = null;
   private currentVideo: HTMLVideoElement | null = null;
   private controller: ScrobbleController | null = null;
+  private history: HistoryRecorder | null = null;
   private abort: AbortController | null = null;
   private reconcileTimer: ReturnType<typeof setTimeout> | null = null;
   /** Latest time the currently pending reconcile may be postponed to. */
@@ -662,6 +664,8 @@ export class SessionManager {
     // Seed the badge immediately with the scraped title, then refine it with what
     // the tracker actually matched — so the user can verify (and fix) the target
     // BEFORE pressing play, not only after the first scrobble fires.
+    // Attach before any network resolution so offline playback is still observed.
+    await this.ensurePlaying();
     const trackerName = trackerLabel(this.tracker);
     const seasonless = isSeasonless(this.tracker); // per-cour trackers have no seasons
     await sendMessage("reportScrobble", { state: "idle", title: label(media, seasonless) });
@@ -783,6 +787,7 @@ export class SessionManager {
     });
     // The pick is locked to a Trakt entry via a correction, so resolveMedia hits;
     // either way the title is set, so seed the badge and let play scrobble it.
+    await this.ensurePlaying();
     const resolved = await sendMessage("resolveMedia", { media, tracker: this.tracker });
     const seasonless = isSeasonless(this.tracker);
     await sendMessage("reportScrobble", {
@@ -996,11 +1001,24 @@ export class SessionManager {
     const tracker = this.tracker;
     const trackers = this.trackers;
     const watchedThreshold = this.watchedThreshold;
+    const history = new HistoryRecorder(
+      video,
+      media,
+      location.hostname,
+      watchedThreshold,
+      (checkpoint) => {
+        void sendMessage("recordHistory", checkpoint).catch(() => {
+          console.warn("[TMSync] Local history checkpoint could not be saved");
+        });
+      },
+    );
+    this.history = history;
     const controller = new ScrobbleController(
       video,
       (action, progress) => {
         this.lastAction = action;
         void sendMessage("scrobble", {
+          historySessionId: history.sessionId,
           action,
           media,
           progress,
@@ -1036,15 +1054,31 @@ export class SessionManager {
     const on = (target: EventTarget, type: string, fn: () => void) =>
       target.addEventListener(type, fn, { signal: abort.signal });
 
-    on(video, "play", () => controller.play());
-    on(video, "pause", () => controller.pause());
-    on(video, "ended", () => controller.ended());
+    on(video, "play", () => {
+      history.start();
+      controller.play();
+    });
+    on(video, "pause", () => {
+      if (!video.ended) history.pause();
+      controller.pause();
+    });
+    on(video, "ended", () => {
+      history.stop(true);
+      controller.ended();
+    });
+    on(video, "seeking", () => history.discontinuity());
+    on(video, "seeked", () => history.discontinuity());
+    on(video, "ratechange", () => history.discontinuity());
     // New media loaded into the same element (SPA episode swap) → reconcile.
     on(video, "loadstart", this.scheduleReconcile);
-    on(window, "pagehide", () => controller.leave());
+    on(window, "pagehide", () => {
+      history.stop();
+      controller.leave();
+    });
 
     let lastPersist = 0;
     on(video, "timeupdate", () => {
+      history.tick();
       // Commit to history the moment playback crosses the threshold — no pause
       // or `ended` required. Cheap + idempotent (one stop per session).
       controller.progressTick();
@@ -1055,7 +1089,10 @@ export class SessionManager {
     });
 
     // If playback is already underway when we attach (late injection), kick a start.
-    if (!video.paused && !video.ended) controller.play();
+    if (!video.paused && !video.ended) {
+      history.start();
+      controller.play();
+    }
   }
 
   /**
@@ -1096,6 +1133,8 @@ export class SessionManager {
   }
 
   private teardownSession(): void {
+    this.history?.stop();
+    this.history = null;
     this.metadataNudges = 0;
     // Emit a stop for the outgoing session (SPA episode swap, nav away) before
     // dropping its listeners. ScrobbleController.leave() is idempotent.

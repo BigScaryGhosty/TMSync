@@ -1,4 +1,5 @@
 import type { ScoreFormat } from "@/lib/anilist/types";
+import type { HistoryCheckpoint } from "@/lib/history/types";
 import type {
   CourSearchOption,
   CourTracker,
@@ -16,6 +17,7 @@ import type { ParsedMedia } from "@tmsync/shared";
 import { defineExtensionMessaging } from "@webext-core/messaging";
 
 export interface ScrobbleRequest {
+  historySessionId?: string;
   action: ScrobbleAction;
   media: ParsedMedia;
   /** 0–100. */
@@ -223,6 +225,7 @@ export type AniListStatus = ProviderStatus;
  * read everything from storage on each call (constraint #4).
  */
 export interface ProtocolMap {
+  recordHistory(checkpoint: HistoryCheckpoint): boolean;
   ping(): "pong";
   getTraktStatus(): TraktStatus;
   connectTrakt(): { ok: boolean; error?: string };
